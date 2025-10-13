@@ -19,7 +19,8 @@ TYPE_MAPPING = {
     r'decimal\((\d+),(\d+)\)': r'numeric(\1,\2)',
     r'numeric\((\d+),(\d+)\)': r'numeric(\1,\2)',
     r'float\((\d+),(\d+)\)': r'real',
-    r'bit\(\d+\)': 'boolean',
+    r'bit\(1\)': 'boolean',  # bit(1) 转为 boolean
+    r'bit\((\d+)\)': r'bit(\1)',  # bit(n) 保持为 bit(n)
     
     # Numeric - 不带括号的版本
     r'tinyint': 'smallint',
@@ -97,6 +98,8 @@ class DDLConverter:
         self.sequences = set()
         self.indexes = set()
         self.comments = set()
+        self.foreign_keys = []  # 存储外键约束,使用列表保持顺序
+        self.data_statements = []
 
     def convert_create_table(self, statement):
         """转换单个 CREATE TABLE 语句"""
@@ -162,7 +165,7 @@ class DDLConverter:
                     cols = [c.strip().strip('`"') for c in key_match.group(2).split(',')]
                     self.indexes.add(f"CREATE INDEX {index_name} ON {table_name} ({', '.join([quote_identifier(c) for c in cols])});")
             
-            # 处理外键
+            # 处理外键 - 收集但不添加到表定义中
             elif re.match(r'CONSTRAINT', item, re.IGNORECASE):
                 fk_match = re.search(r'CONSTRAINT\s+[`"]?(\w+)[`"]?\s+FOREIGN\s+KEY\s*\(([^)]+)\)\s+REFERENCES\s+[`"]?(\w+)[`"]?\s*\(([^)]+)\)', item, re.IGNORECASE)
                 if fk_match:
@@ -170,8 +173,9 @@ class DDLConverter:
                     fk_cols = [c.strip().strip('`"') for c in fk_match.group(2).split(',')]
                     ref_table = quote_identifier(fk_match.group(3))
                     ref_cols = [c.strip().strip('`"') for c in fk_match.group(4).split(',')]
-                    fk_def = f"CONSTRAINT {fk_name} FOREIGN KEY ({', '.join([quote_identifier(c) for c in fk_cols])}) REFERENCES {ref_table} ({', '.join([quote_identifier(c) for c in ref_cols])})"
-                    foreign_key_defs.append(fk_def)
+                    # 生成ALTER TABLE语句,稍后添加
+                    alter_stmt = f"ALTER TABLE {table_name} ADD CONSTRAINT {fk_name} FOREIGN KEY ({', '.join([quote_identifier(c) for c in fk_cols])}) REFERENCES {ref_table} ({', '.join([quote_identifier(c) for c in ref_cols])});"
+                    self.foreign_keys.append(alter_stmt)
             
             # 处理列定义
             else:
@@ -179,11 +183,11 @@ class DDLConverter:
                 if col_def:
                     column_definitions.append(col_def)
 
-        # 组装最终的 CREATE TABLE 语句
+        # 组装最终的 CREATE TABLE 语句 (不包含外键约束)
         all_defs = column_definitions
         if primary_key_def:
             all_defs.append(primary_key_def)
-        all_defs.extend(foreign_key_defs)
+        # 不再添加 foreign_key_defs,它们已经被收集到 self.foreign_keys 中
 
         pg_statements.append(f"CREATE TABLE {table_name} (\n    " + ",\n    ".join(all_defs) + "\n);")
         
@@ -253,6 +257,11 @@ class DDLConverter:
                 default_val = 'CURRENT_TIMESTAMP'
             elif default_val.upper() == 'NULL':
                 default_val = 'NULL'
+            # 处理 bit 类型的默认值 b'0' 和 b'1'
+            elif default_val == "b'0'" or default_val == 'b"0"':
+                default_val = "'0'"
+            elif default_val == "b'1'" or default_val == 'b"1"':
+                default_val = "'1'"
             col_def += f" DEFAULT {default_val}"
         
         # 处理 AUTO_INCREMENT
@@ -282,12 +291,10 @@ class DDLConverter:
         sql_content = re.sub(r"SET\s+NAMES.*?;", "", sql_content, flags=re.IGNORECASE)
         
         parsed_statements = sqlparse.parse(sql_content)
-        
+
         pg_output = []
-        pg_output.append("-- PostgreSQL DDL generated from MySQL schema")
-        pg_output.append("-- Generation Date: " + str(datetime.datetime.now()))
-        pg_output.append("\n-- ===== SEQUENCES =====")
-        
+        self.data_statements = []
+
         for stmt in parsed_statements:
             if stmt.get_type() == 'CREATE':
                 # 使用字符串匹配检查是否是 CREATE TABLE
@@ -295,6 +302,10 @@ class DDLConverter:
                 if re.match(r'CREATE\s+TABLE', stmt_str, re.IGNORECASE):
                     converted = self.convert_create_table(stmt)
                     pg_output.extend(converted)
+            elif stmt.get_type() == 'INSERT':
+                converted_insert = self.convert_insert_statement(stmt)
+                if converted_insert:
+                    self.data_statements.append(converted_insert)
 
         # 将所有收集到的语句按正确顺序组合
         final_output = []
@@ -302,8 +313,14 @@ class DDLConverter:
         final_output.extend(sorted(list(self.sequences)))
         final_output.append("\n-- ===== TABLES =====")
         final_output.extend(pg_output)
+        if self.data_statements:
+            final_output.append("\n-- ===== DATA =====")
+            final_output.extend(self.data_statements)
         final_output.append("\n-- ===== INDEXES =====")
         final_output.extend(sorted(list(self.indexes)))
+        final_output.append("\n-- ===== FOREIGN KEYS =====")
+        final_output.append("-- 外键约束在所有表创建完成后添加,避免循环依赖问题")
+        final_output.extend(self.foreign_keys)
         final_output.append("\n-- ===== COMMENTS =====")
         final_output.extend(sorted(list(self.comments)))
 
@@ -312,6 +329,31 @@ class DDLConverter:
             f.write("\n".join(final_output))
         
         print("转换成功！")
+
+    def convert_insert_statement(self, statement):
+        """转换单个 INSERT 语句"""
+        stmt_str = str(statement).strip()
+        if not stmt_str:
+            return None
+
+        # 将反引号标识符替换为双引号
+        def replace_identifier(match):
+            identifier = match.group(1)
+            return f'"{identifier}"'
+
+        converted = re.sub(r'`([^`]+)`', replace_identifier, stmt_str)
+
+        # 处理 bit 字面量 b'0'/b'1'
+        converted = re.sub(r"\bb'([01])'", r"'\1'", converted)
+        converted = re.sub(r'\bb"([01])"', r"'\1'", converted)
+
+        # MySQL 中的转义单引号 \'
+        converted = converted.replace("\\'", "''")
+
+        # MySQL 的 \N 表示 NULL
+        converted = re.sub(r'(?<!\\)\\N', 'NULL', converted)
+
+        return converted
 
 
 if __name__ == '__main__':

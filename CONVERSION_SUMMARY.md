@@ -77,6 +77,39 @@ python mysql_to_pg_converter.py ~/dump-socialcollect_sdwyf-202510122351.sql soci
 3. 验证所有约束和索引是否正确创建
 4. 检查应用程序兼容性
 
+## 数据迁移注意事项
+
+### Bit(1)类型和默认值转换
+
+MySQL的`bit(1)`类型转换为PostgreSQL的`boolean`类型。
+
+**默认值转换:**
+转换器自动处理默认值:
+- MySQL: `DEFAULT b'0'` → PostgreSQL: `DEFAULT '0'`
+- MySQL: `DEFAULT b'1'` → PostgreSQL: `DEFAULT '1'`
+
+PostgreSQL的boolean类型接受`'0'`和`'1'`作为有效值。
+
+**数据迁移转换:**
+- MySQL数据: `b'0'` → PostgreSQL: `FALSE` 或 `0` 或 `'0'`
+- MySQL数据: `b'1'` → PostgreSQL: `TRUE` 或 `1` 或 `'1'`
+
+**推荐的数据转换方法:**
+
+1. **使用mysqldump导出**: 数据会自动转为0/1数字
+   ```bash
+   mysqldump --compatible=postgresql database_name > dump.sql
+   ```
+
+2. **使用ETL工具**: 配置字段映射规则
+   - `b'0'` → `FALSE` 或 `0`
+   - `b'1'` → `TRUE` 或 `1`
+
+3. **手动转换CSV**: 
+   ```bash
+   sed "s/b'0'/0/g; s/b'1'/1/g" data.csv > data_converted.csv
+   ```
+
 ## 代码改进
 
 本次调试修复的问题:
@@ -89,3 +122,19 @@ python mysql_to_pg_converter.py ~/dump-socialcollect_sdwyf-202510122351.sql soci
 7. ✅ 修复了注释提取的正则表达式，支持中文注释
 8. ✅ 添加了CHARACTER SET和COLLATE子句的移除
 9. ✅ 改进了DEFAULT值的解析，支持带引号的字符串
+10. ✅ **修复外键循环依赖问题** - 采用后置创建外键约束的方式，避免表创建时的循环依赖
+11. ✅ **改进bit类型映射和默认值处理** - `bit(1)`转为`boolean`, 默认值`b'0'`/`b'1'`自动转为`'0'`/`'1'`
+
+## 外键处理策略
+
+为了解决外键循环依赖问题（例如表A引用表B，表B又引用表A），转换器采用以下策略：
+
+1. **第一阶段**: 创建所有表结构（不包含外键约束）
+2. **第二阶段**: 创建所有索引
+3. **第三阶段**: 使用 `ALTER TABLE ADD CONSTRAINT` 添加所有外键约束
+4. **第四阶段**: 添加列注释
+
+这样可以确保：
+- 所有表都已存在时才添加外键
+- 避免因表创建顺序导致的依赖问题
+- 支持任意复杂的外键关系网络
