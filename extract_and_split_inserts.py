@@ -3,6 +3,13 @@
 """
 从MySQL dump文件中提取INSERT语句，转换为PostgreSQL格式，并分割成多个文件
 专门处理超大文件（1.4GB+），支持Windows换行符
+
+支持的INSERT格式:
+1. 单行INSERT: INSERT INTO table VALUES (val1, val2);
+2. 同行多VALUES: INSERT INTO table VALUES (val1, val2), (val3, val4);
+3. 跨行INSERT: INSERT INTO table VALUES 
+                (val1, val2),
+                (val3, val4);
 """
 
 import re
@@ -64,9 +71,45 @@ class InsertExtractorAndSplitter:
         
         return converted
     
+    def _write_insert(self, output_handle, converted_line, current_output_file, output_path, output_prefix):
+        """
+        写入转换后的INSERT语句,并处理文件分割
+        :param output_handle: 当前输出文件句柄
+        :param converted_line: 转换后的INSERT语句
+        :param current_output_file: 当前输出文件路径
+        :param output_path: 输出目录路径
+        :param output_prefix: 输出文件前缀
+        :return: 新的output_handle和current_output_file(如果发生了文件切换)
+        """
+        # 检查是否需要切换到新文件
+        line_bytes = len(converted_line.encode('utf-8')) + 1  # +1 for newline
+        
+        if self.current_chunk_size + line_bytes > self.chunk_size_bytes and self.current_chunk_size > 0:
+            # 写入文件尾部并关闭当前文件
+            self._write_footer(output_handle)
+            output_handle.close()
+            print(f"完成文件 {self.chunk_number}: {current_output_file.name} "
+                  f"({self.current_chunk_size / (1024**2):.2f} MB, "
+                  f"{self.total_inserts} 条INSERT语句)")
+            
+            # 打开新文件
+            self.chunk_number += 1
+            self.current_chunk_size = 0
+            current_output_file = output_path / f"{output_prefix}_part_{self.chunk_number:03d}.sql"
+            output_handle = open(current_output_file, 'w', encoding='utf-8', newline='\n')
+            self._write_header(output_handle, self.chunk_number)
+        
+        # 写入转换后的语句
+        output_handle.write(converted_line + '\n')
+        self.current_chunk_size += line_bytes
+        self.total_inserts += 1
+        
+        return output_handle, current_output_file
+    
     def process_file(self, input_file, output_dir, output_prefix='pg_inserts'):
         """
         处理输入文件，提取INSERT语句并分割
+        支持单行和多行INSERT语句
         :param input_file: 输入的MySQL dump文件路径
         :param output_dir: 输出目录
         :param output_prefix: 输出文件前缀
@@ -93,6 +136,10 @@ class InsertExtractorAndSplitter:
         processed_bytes = 0
         line_number = 0
         
+        # 用于收集多行INSERT语句
+        insert_buffer = []
+        in_insert = False
+        
         try:
             # 使用二进制模式读取，然后解码，以便正确处理Windows换行符
             with open(input_file, 'rb') as f:
@@ -110,32 +157,44 @@ class InsertExtractorAndSplitter:
                             print(f"警告: 第 {line_number} 行解码失败，跳过", file=sys.stderr)
                             continue
                     
-                    # 转换INSERT语句
-                    converted_line = self.convert_insert_line(line)
+                    # 去除行尾换行符
+                    line = line.rstrip('\r\n')
                     
-                    if converted_line:
-                        # 检查是否需要切换到新文件
-                        line_bytes = len(converted_line.encode('utf-8')) + 1  # +1 for newline
+                    # 检测INSERT语句开始
+                    if not in_insert and re.match(r'^\s*INSERT\s+INTO', line, re.IGNORECASE):
+                        in_insert = True
+                        insert_buffer = [line]
                         
-                        if self.current_chunk_size + line_bytes > self.chunk_size_bytes and self.current_chunk_size > 0:
-                            # 写入文件尾部并关闭当前文件
-                            self._write_footer(output_handle)
-                            output_handle.close()
-                            print(f"完成文件 {self.chunk_number}: {current_output_file.name} "
-                                  f"({self.current_chunk_size / (1024**2):.2f} MB, "
-                                  f"{self.total_inserts} 条INSERT语句)")
+                        # 检查是否在同一行结束(以分号结尾)
+                        if line.rstrip().endswith(';'):
+                            # 单行INSERT语句
+                            complete_insert = ' '.join(insert_buffer)
+                            converted_line = self.convert_insert_line(complete_insert)
                             
-                            # 打开新文件
-                            self.chunk_number += 1
-                            self.current_chunk_size = 0
-                            current_output_file = output_path / f"{output_prefix}_part_{self.chunk_number:03d}.sql"
-                            output_handle = open(current_output_file, 'w', encoding='utf-8', newline='\n')
-                            self._write_header(output_handle, self.chunk_number)
+                            if converted_line:
+                                output_handle, current_output_file = self._write_insert(
+                                    output_handle, converted_line, current_output_file, output_path, output_prefix)
+                            
+                            # 重置状态
+                            insert_buffer = []
+                            in_insert = False
+                    elif in_insert:
+                        # 继续收集多行INSERT语句
+                        insert_buffer.append(line)
                         
-                        # 写入转换后的语句
-                        output_handle.write(converted_line + '\n')
-                        self.current_chunk_size += line_bytes
-                        self.total_inserts += 1
+                        # 检查是否结束(以分号结尾)
+                        if line.rstrip().endswith(';'):
+                            # 多行INSERT语句完成
+                            complete_insert = ' '.join(insert_buffer)
+                            converted_line = self.convert_insert_line(complete_insert)
+                            
+                            if converted_line:
+                                output_handle, current_output_file = self._write_insert(
+                                    output_handle, converted_line, current_output_file, output_path, output_prefix)
+                            
+                            # 重置状态
+                            insert_buffer = []
+                            in_insert = False
                     
                     # 显示进度
                     if line_number % 10000 == 0:
