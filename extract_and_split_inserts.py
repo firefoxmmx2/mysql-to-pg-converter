@@ -52,6 +52,12 @@ class InsertExtractorAndSplitter:
         converted = re.sub(r"\bb'([01])'", r"'\1'", converted)
         converted = re.sub(r'\bb"([01])"', r"'\1'", converted)
         
+        # MySQL BIT(1) 或布尔在dump中的常见表示 -> PostgreSQL boolean
+        converted = converted.replace("'\\0'", 'FALSE')
+        converted = converted.replace("'\\1'", 'TRUE')
+        converted = converted.replace("'\x00'", 'FALSE')
+        converted = converted.replace("'\x01'", 'TRUE')
+        
         # 3. MySQL中的转义单引号 \' -> ''（PostgreSQL标准）
         converted = converted.replace("\\'", "''")
         
@@ -60,7 +66,7 @@ class InsertExtractorAndSplitter:
         
         # 5. 处理其他常见的MySQL转义序列
         # \0 -> 空字符（在PostgreSQL中需要特殊处理，这里简化为空）
-        converted = converted.replace('\\0', '')
+        converted = re.sub(r"(?<!')\\0(?!')", '', converted)
         
         # 6. 处理双反斜杠 \\ -> \
         converted = converted.replace('\\\\', '\\')
